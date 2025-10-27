@@ -1,0 +1,248 @@
+/*
+ * ESP32 VWMITM - Symmetric Dual CAN Translator
+ * 
+ * BOTH buses do identical tasks:
+ * - Listen for 0x288
+ * - Translate to 0x0FD with VAG CRC8
+ * - Send 0x123 heartbeat
+ * 
+ * ESP32 CAN:   Heartbeat A1 (idle) / A2 (translating)
+ * MCP2515 CAN: Heartbeat B1 (idle) / B2 (translating)
+ */
+
+#ifndef ARDUINO_ARCH_ESP32
+  #error "Select an ESP32 board" 
+#endif
+
+#include <ACAN_ESP32.h>
+#include <ACAN2515.h>
+
+#define LED_BUILTIN 2
+
+// MCP2515 Hardware
+static const byte MCP2515_SCK  = 18;
+static const byte MCP2515_MOSI = 23;
+static const byte MCP2515_MISO = 19;
+static const byte MCP2515_CS   = 5;
+static const byte MCP2515_INT  = 27;
+static const uint32_t QUARTZ_FREQUENCY = 8UL * 1000UL * 1000UL;
+
+ACAN2515 bmsCan(MCP2515_CS, SPI, MCP2515_INT);
+
+// State tracking
+bool translatingESP32 = false;
+bool translatingMCP = false;
+unsigned long last288TimeESP32 = 0;
+unsigned long last288TimeMCP = 0;
+unsigned long lastHeartbeat = 0;
+
+// Separate counters for each bus
+uint8_t counter_0FD_ESP32 = 0x00;
+uint8_t counter_0FD_MCP = 0x00;
+
+bool mcpOK = false;
+
+// ===== VAG CRC8 =====
+const uint8_t magicBytes[16] = {
+    0xA3, 0xA9, 0x66, 0x13, 0x85, 0x1F, 0x0D, 0x37,
+    0xF0, 0xC2, 0x8E, 0xA1, 0x38, 0xB1, 0x4E, 0xD9
+};
+
+uint8_t vag_crc_esp21(const uint8_t *data, int len, uint8_t counter) {
+    uint8_t crc = 0x00;
+    
+    for (int i = 0; i < len; i++) { 
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ 0x2F;
+            else
+                crc = crc << 1;
+        }
+    }
+    
+    return crc ^ magicBytes[counter & 0x0F];
+}
+
+void build_payload(uint8_t *payload, const uint8_t *frame) {
+    payload[0] = frame[1] & 0xF0;
+    for (int i = 0; i < 6; i++) {
+        payload[i + 1] = frame[i + 2];
+    }
+    payload[7] = 0x00;
+}
+
+// ===== Create 0x0FD message from 0x288 =====
+CANMessage create0x0FD(const CANMessage &msg288, uint8_t &counter) {
+    // Extract speed from D4 (byte 3)
+    uint8_t speedByte = msg288.data[3];
+    float speedKph = (float)speedByte * 1.28f;
+    uint16_t speedValue = (uint16_t)(speedKph * 100.0f + 0.5f);
+    
+    // Build frame
+    uint8_t frame[8] = {0};
+    frame[1] = 0xD0 | (counter & 0x0F);
+    frame[2] = 0x1F;
+    frame[3] = 0x82;
+    frame[4] = (uint8_t)(speedValue & 0xFF);
+    frame[5] = (uint8_t)((speedValue >> 8) & 0xFF);
+    frame[6] = 0x00;
+    frame[7] = 0x00;
+    
+    // Calculate CRC
+    uint8_t payload[8];
+    build_payload(payload, frame);
+    frame[0] = vag_crc_esp21(payload, 8, counter);
+    
+    // Increment counter
+    counter = (counter + 1) & 0x0F;
+    
+    // Create CAN message
+    CANMessage msg0FD;
+    msg0FD.id = 0x0FD;
+    msg0FD.ext = false;
+    msg0FD.rtr = false;
+    msg0FD.len = 8;
+    for (int i = 0; i < 8; i++) {
+        msg0FD.data[i] = frame[i];
+    }
+    
+    return msg0FD;
+}
+
+// ===== MCP2515 Callback for received messages =====
+static void receivedFromMCP(const CANMessage &inMessage) {
+    if (inMessage.id == 0x288 && inMessage.len >= 4) {
+        translatingMCP = true;
+        last288TimeMCP = millis();
+        
+        // Translate and send 0x0FD on MCP2515
+        CANMessage msg0FD = create0x0FD(inMessage, counter_0FD_MCP);
+        bmsCan.tryToSend(msg0FD);
+    }
+}
+
+void setup() {
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(1000);
+    
+    // ===== ESP32 CAN =====
+    ACAN_ESP32_Settings settingsESP(500 * 1000);
+    settingsESP.mRxPin = GPIO_NUM_16;
+    settingsESP.mTxPin = GPIO_NUM_17;
+    ACAN_ESP32::can.begin(settingsESP);
+    
+    // 1 blink = ESP32 init
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(200);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(500);
+    
+    // ===== MCP2515 =====
+    SPI.begin(MCP2515_SCK, MCP2515_MISO, MCP2515_MOSI);
+    
+    ACAN2515Settings settingsMCP(QUARTZ_FREQUENCY, 500UL * 1000UL);
+    settingsMCP.mRequestedMode = ACAN2515Settings::NormalMode;
+    
+    // Set up filters to accept all messages and use callback
+    const ACAN2515Mask rxm0 = standard2515Mask(0x000, 0, 0);
+    const ACAN2515Mask rxm1 = standard2515Mask(0x000, 0, 0);
+    const ACAN2515AcceptanceFilter filters[] = {
+        {standard2515Filter(0x000, 0, 0), receivedFromMCP}
+    };
+    
+    uint16_t errMCP = bmsCan.begin(settingsMCP, [] { bmsCan.isr(); }, rxm0, rxm1, filters, 1);
+    
+    if (errMCP == 0) {
+        mcpOK = true;
+        // 2 blinks = MCP OK
+        for (int i = 0; i < 2; i++) {
+            digitalWrite(LED_BUILTIN, HIGH);
+            delay(200);
+            digitalWrite(LED_BUILTIN, LOW);
+            delay(200);
+        }
+    } else {
+        // 5 fast blinks = MCP failed
+        for (int i = 0; i < 5; i++) {
+            digitalWrite(LED_BUILTIN, HIGH);
+            delay(100);
+            digitalWrite(LED_BUILTIN, LOW);
+            delay(100);
+        }
+    }
+    
+    delay(1000);
+}
+
+void loop() {
+    CANMessage frame;
+    
+    // ===== ESP32: Check for 0x288 and translate =====
+    while (ACAN_ESP32::can.receive(frame)) {
+        if (frame.id == 0x288 && frame.len >= 4) {
+            translatingESP32 = true;
+            last288TimeESP32 = millis();
+            
+            // Translate and send 0x0FD on ESP32
+            CANMessage msg0FD = create0x0FD(frame, counter_0FD_ESP32);
+            ACAN_ESP32::can.tryToSend(msg0FD);
+        }
+    }
+    
+    // ===== MCP2515: Process received messages (calls receivedFromMCP) =====
+    if (mcpOK) {
+        bmsCan.dispatchReceivedMessage();
+    }
+    
+    // ===== Timeout checks =====
+    if (translatingESP32 && (millis() - last288TimeESP32 > 500)) {
+        translatingESP32 = false;
+    }
+    if (translatingMCP && (millis() - last288TimeMCP > 500)) {
+        translatingMCP = false;
+    }
+    
+    // ===== Send heartbeats every 100ms on BOTH buses =====
+    if (millis() - lastHeartbeat >= 100) {
+        lastHeartbeat = millis();
+        
+        // ESP32 heartbeat: A1 or A2
+        CANMessage heartbeatA;
+        heartbeatA.id = 0x123;
+        heartbeatA.ext = false;
+        heartbeatA.rtr = false;
+        heartbeatA.len = 8;
+        uint8_t byteA = translatingESP32 ? 0xA2 : 0xA1;
+        for (int i = 0; i < 8; i++) {
+            heartbeatA.data[i] = byteA;
+        }
+        ACAN_ESP32::can.tryToSend(heartbeatA);
+        
+        // MCP2515 heartbeat: B1 or B2
+        if (mcpOK) {
+            CANMessage heartbeatB;
+            heartbeatB.id = 0x123;
+            heartbeatB.ext = false;
+            heartbeatB.rtr = false;
+            heartbeatB.len = 8;
+            uint8_t byteB = translatingMCP ? 0xB2 : 0xB1;
+            for (int i = 0; i < 8; i++) {
+                heartbeatB.data[i] = byteB;
+            }
+            bmsCan.tryToSend(heartbeatB);
+        }
+        
+        // LED blink
+        static int blinkCount = 0;
+        if (blinkCount++ >= 10) {
+            blinkCount = 0;
+            digitalWrite(LED_BUILTIN, HIGH);
+            delay(50);
+            digitalWrite(LED_BUILTIN, LOW);
+        }
+    }
+    
+    delay(1);
+}
