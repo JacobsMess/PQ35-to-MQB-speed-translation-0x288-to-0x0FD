@@ -1,0 +1,14 @@
+void loop() {
+  if (millis() - lastBeat >= 100) {
+    lastBeat = millis();
+    if (sendESP()) esp_ok++; else esp_fail++;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  }
+
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    Serial.print("[ESP] ok="); Serial.print(esp_ok);
+    Serial.print(" fail="); Serial.println(esp_fail);
+  }
+  yield();
+}
