@@ -1,14 +1,89 @@
+#ifndef ARDUINO_ARCH_ESP32
+  #error "Select an ESP32 board"
+#endif
+
+#include <ACAN_ESP32.h>
+
+#define LED_BUILTIN 2
+
+// ===== ESP32 CAN pins (as per your hardware) =====
+static const gpio_num_t ESP32_CAN_RX = GPIO_NUM_16;
+static const gpio_num_t ESP32_CAN_TX = GPIO_NUM_17;
+
+unsigned long lastBeat = 0;
+unsigned long lastPrint = 0;
+
+uint32_t esp_ok = 0, esp_fail = 0;
+uint8_t esp_seq = 0;
+
+static bool sendESP() {
+  CANMessage m;
+  m.id  = 0x123;
+  m.ext = false;
+  m.rtr = false;
+  m.len = 8;
+
+  // A1 pattern, with a changing last byte so it's obvious it's alive
+  for (int i = 0; i < 7; i++) m.data[i] = 0xA1;
+  m.data[7] = esp_seq++;
+
+  return ACAN_ESP32::can.tryToSend(m);
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== ESP32 CAN Heartbeat Test ===");
+  Serial.println("Sending ID 0x123 with payload A1 A1 A1 A1 A1 A1 A1 [seq]");
+
+  // ---- ESP32 CAN init ----
+  ACAN_ESP32_Settings s(500 * 1000);
+  s.mRxPin = ESP32_CAN_RX;
+  s.mTxPin = ESP32_CAN_TX;
+
+  const uint32_t err = ACAN_ESP32::can.begin(s);
+  Serial.print("ESP32 CAN begin err=0x");
+  Serial.println(err, HEX);
+
+  if (err != 0) {
+    Serial.println("ESP32 CAN init FAILED. Halting.");
+    while (1) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      delay(100);
+    }
+  }
+
+  Serial.println("CAN initialized successfully!");
+  Serial.println("Look in SavvyCAN for ID 0x123 at 10 Hz");
+}
+
 void loop() {
+  // Drain any received messages
+  CANMessage rx;
+  while (ACAN_ESP32::can.receive(rx)) { /* ignore */ }
+
+  // Send at 10 Hz (every 100ms)
   if (millis() - lastBeat >= 100) {
     lastBeat = millis();
-    if (sendESP()) esp_ok++; else esp_fail++;
+    if (sendESP()) {
+      esp_ok++;
+    } else {
+      esp_fail++;
+    }
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
+  // Print stats every second
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
-    Serial.print("[ESP] ok="); Serial.print(esp_ok);
-    Serial.print(" fail="); Serial.println(esp_fail);
+    Serial.print("[ESP] ok=");
+    Serial.print(esp_ok);
+    Serial.print(" fail=");
+    Serial.println(esp_fail);
   }
+
   yield();
 }
